@@ -1,0 +1,9 @@
+{
+  "prefix": "",
+  "scene": "",
+  "region": "cn",
+  "edge_secret": "",
+  "sms_url": "",
+  "captcha_enabled": false,
+  "sms_daily_cap": 100
+}
