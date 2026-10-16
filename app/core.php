@@ -21,7 +21,16 @@ function default_options(): array {return ['window_start'=>'08:00','window_end'=
 function options(array $m): array {return array_replace(default_options(),json_decode($m['settings'],true)??[]);}
 function bounds(float $now,array $o): array {$day=date('Y-m-d',(int)$now);return [$day,(float)strtotime($day.' '.$o['window_start']),(float)strtotime($day.' '.$o['window_end'])];}
 function quota(int $id,string $day): int {return (int)one("SELECT COUNT(*) n FROM ca_attempts WHERE meter_id=? AND day=? AND kind<>'manual'",[$id,$day])['n'];}
-function latest(array $m): ?array {return one('SELECT * FROM ca_readings WHERE meter_id=? AND revision=? ORDER BY ts DESC,id DESC LIMIT 1',[$m['id'],$m['revision']]);}
+function meter_query_fingerprint(array $m): string {return hash('sha256',json_value([$m['school_code'],unseal($m['account_secret']),$m['command'],$m['business_type'],$m['roomverify']]));}
+function meter_series_hint(array $m): ?string {
+    $room=$m['roomverify'];if($room===''){$binding=state((int)$m['id'],'active_series',[]);if(isset($binding['query_hash'],$binding['series'])&&hash_equals(meter_query_fingerprint($m),$binding['query_hash']))return $binding['series'];$rooms=state((int)$m['id'],'rooms',[]);if(count($rooms)===1)$room=(string)$rooms[0]['roomverify'];}
+    return $room===''?null:hash('sha256',$m['school_code'].':'.unseal($m['account_secret']).':'.$room.':'.$m['business_type']);
+}
+function latest_for_series(array $m,string $series): ?array {return one('SELECT * FROM ca_readings WHERE meter_id=? AND series=? ORDER BY ts DESC,id DESC LIMIT 1',[$m['id'],$series]);}
+function latest(array $m,bool $strictRevision=false): ?array {
+    if(!$strictRevision){$series=meter_series_hint($m);if($series!==null)return latest_for_series($m,$series);}
+    return one('SELECT * FROM ca_readings WHERE meter_id=? AND revision=? ORDER BY ts DESC,id DESC LIMIT 1',[$m['id'],$m['revision']]);
+}
 function user(): array {$id=(int)($_SESSION['uid']??0);$u=$id?one('SELECT id,username,role,phone,enabled,session_version FROM ca_users WHERE id=?',[$id]):null;if(!$u||!(int)$u['enabled']||time()>($_SESSION['expires']??0)||(int)$u['session_version']!==($_SESSION['version']??0)){unset($_SESSION['uid']);throw new AppError('请登录',401);}return $u;}
 function owner_meter(int $id,array $u,bool $lock=false): array {$m=one('SELECT * FROM ca_meters WHERE id=? AND user_id=?'.($lock?' FOR UPDATE':''),[$id,$u['id']]);if(!$m)throw new AppError('监控项目不存在',404);return $m;}
 function valid_username(string $name): bool {return (bool)preg_match('/^[A-Za-z0-9_-]{3,32}$/D',$name);}

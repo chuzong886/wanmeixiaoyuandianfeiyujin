@@ -45,6 +45,34 @@ try{
     $before=outcount301($id);forecast_notice($m,$low,$now+15*3600+2);verify301(outcount301($id)===$before,'accepted notification does not repeat');
     perform_query($m,$now+60,'manual',function()use($body,$u,$series,$room){$edit=$body;$edit['options']=['critical_kwh'=>18];save_meter($edit,$u);return ['balance'=>17.,'balance_raw'=>'17','series'=>$series,'room'=>'临时测试项目','rooms'=>[['roomverify'=>$room,'label'=>'临时测试项目']]];});
     $m=one('SELECT * FROM ca_meters WHERE id=?',[$id]);verify301(json_decode(latest($m)['analysis'],true)['critical'],'in-flight query uses newly saved alarm thresholds');
+    // Reproduce the missed case: the current revision already has a cold-start row.
+    $otherRoom=bin2hex(random_bytes(8));$otherSeries=hash('sha256',$school.':'.$account.':'.$otherRoom.':0');
+    $secondBody=['label'=>'跨版本连续训练测试','school_code'=>$school,'account'=>$account,'roomverify'=>$otherRoom,'enabled'=>true,'options'=>['window_start'=>'00:00','window_end'=>'23:59']];
+    $second=save_meter($secondBody,$u);$mm=one('SELECT * FROM ca_meters WHERE id=?',[$second]);
+    foreach([50.,42.,34.,26.,18.] as $i=>$balance){$at2=$now-48*3600+$i*8*3600;perform_query($mm,$at2,'manual',fn()=>['balance'=>$balance,'balance_raw'=>(string)$balance,'series'=>$otherSeries,'room'=>'临时连续训练项目','rooms'=>[['roomverify'=>$otherRoom,'label'=>'临时连续训练项目']]]);}
+    sql('UPDATE ca_meters SET revision=2 WHERE id=?',[$second]);$mm=one('SELECT * FROM ca_meters WHERE id=?',[$second]);$coldAt=$now-3600;$cold=analyse_reading(null,[],[],null,['balance'=>10.,'balance_raw'=>'10','series'=>$otherSeries],$coldAt,options($mm))['analysis'];
+    $coldAttempt=reserve_attempt($mm,$coldAt,'manual');sql('INSERT INTO ca_readings(meter_id,attempt_id,revision,series,ts,balance,balance_raw,balance_exact,room,quality,analysis) VALUES (?,?,?,?,?,?,?,?,?,?,?)',[$second,$coldAttempt,2,$otherSeries,$coldAt,10.,'10','10.000000','临时连续训练项目',$cold['quality'],json_value($cold)]);sql("UPDATE ca_attempts SET state='ok' WHERE id=?",[$coldAttempt]);
+    verify301($cold['provisional'],'fixture reproduces current revision with a cold-start reading');
+    $combined=dashboard($mm);verify301(count($combined['history'])===6&&count($combined['intervals'])===4&&$combined['reused_history_readings']===5,'current monitor includes matching observations and intervals across revisions');
+    $viewOld=dashboard($mm,14,1);verify301(count($viewOld['history'])===5&&$viewOld['viewing_history']&&$viewOld['manual_reason']==='','archive allows verifying current dorm to continue monitoring');
+    $beforeSource=one('SELECT snapshot FROM ca_forecast_runs WHERE meter_id=? ORDER BY id LIMIT 1',[$second])['snapshot'];
+    set_state($second,'schedule',['day'=>date('Y-m-d',(int)$now-86400),'next'=>$now-86400]);sql('UPDATE ca_meters SET next_query=? WHERE id=?',[$now-86400,$second]);
+    $preview=dashboard($mm);verify301($preview['plan_pending_worker']&&$preview['schedule']['day']===date('Y-m-d',(int)$now),'dashboard previews a current plan when stored plan belongs to yesterday');verify301(state($second,'schedule')['day']!==$preview['schedule']['day'],'viewing a preview never silently writes or runs a query');
+    perform_query($mm,$now-1800,'manual',fn()=>['balance'=>10.,'balance_raw'=>'10','series'=>$otherSeries,'room'=>'临时连续训练项目','rooms'=>[['roomverify'=>$otherRoom,'label'=>'临时连续训练项目']]]);verify301(json_decode(latest($mm)['analysis'],true)['provisional'],'cached cold forecast is not relabeled mature or fresh merely by finding older data');
+    perform_query($mm,$now,'manual',fn()=>['balance'=>9.,'balance_raw'=>'9','series'=>$otherSeries,'room'=>'临时连续训练项目','rooms'=>[['roomverify'=>$otherRoom,'label'=>'临时连续训练项目']]]);
+    $updated=json_decode(latest($mm)['analysis'],true);verify301(!$updated['provisional']&&$updated['coverage_hours']>=32&&$updated['samples']>=4,'fresh query trains using old matching intervals despite nonempty current revision');
+    verify301((int)latest($mm)['revision']===2,'new reading stays in current revision without rewriting history');
+    verify301(one('SELECT snapshot FROM ca_forecast_runs WHERE meter_id=? ORDER BY id LIMIT 1',[$second])['snapshot']===$beforeSource,'old prediction snapshot never rewritten as a new forecast');
+    $plan=state($second,'schedule');verify301($plan['day']===date('Y-m-d',(int)$now)&&$plan['basis_reading_id']===(int)latest($mm)['id']&&$plan['next']>=$now,'manual query replaces yesterday plan with current basis and time');
+    verify301(!schedule_is_stale($mm,$now),'saved plan signature matches current configuration and reading');
+    $oldNext=$plan['next'];rebuild_schedule($mm,$now+60);verify301(state($second,'schedule')['next']<=$oldNext+60,'refresh does not repeatedly postpone an earlier plan');
+    $tickAt=(float)strtotime(date('Y-m-d',(int)$now).' +1 day 12:00');$queries=0;tick_meter($mm,$tickAt,function()use(&$queries,$otherSeries,$otherRoom){$queries++;return ['balance'=>8.,'balance_raw'=>'8','series'=>$otherSeries,'room'=>'临时连续训练项目','rooms'=>[['roomverify'=>$otherRoom,'label'=>'临时连续训练项目']]];});
+    verify301($queries===1&&(float)latest($mm)['ts']===$tickAt,'cron repairs day rollover and actually executes a fresh automatic query');
+    verify301(!json_decode(latest($mm)['analysis'],true)['provisional'],'automatic continuation keeps historical load learning');
+    verify301(state($second,'schedule')['next']>=$tickAt&&(float)state($second,'schedule')['calculated_at']===$tickAt,'automatic task writes latest plan instead of old timestamps');
+    $ownOther=dashboard($m);verify301($ownOther['reused_history_readings']===0,'another dorm never receives this matching-series history');
+    $differentBinding=$secondBody;$differentBinding['id']=$second;$differentBinding['roomverify']=bin2hex(random_bytes(8));save_meter($differentBinding,$u);$unmatched=one('SELECT * FROM ca_meters WHERE id=?',[$second]);verify301(latest($unmatched)===null&&dashboard($unmatched)['reused_history_readings']===0,'same meter changing to a different dorm never reuses unrelated observations');
+    set_setting('history_continuity_v302',false);migrate_v302();verify301(setting('app_version')==='3.0.2','3.0.2 upgrade completes');$recordsBefore=(int)one('SELECT COUNT(*) n FROM ca_readings')['n'];migrate_v302();verify301((int)one('SELECT COUNT(*) n FROM ca_readings')['n']===$recordsBefore,'continuity upgrade is idempotent and preserves rows');
     if(getenv('CAMPUS_KEEP_TEST_DB')==='1')file_put_contents(ROOT.'/.test-runtime/ui-login.json',json_value(['username'=>$username,'password'=>$password,'database'=>$dbName]));
     echo "$n integration checks passed; all queries and deliveries mocked\n";
 }finally{

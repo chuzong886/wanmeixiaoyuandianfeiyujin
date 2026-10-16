@@ -32,10 +32,22 @@ function migrate_v301(): void {
     if(setting('model_migrated_v301',false)){set_setting('app_version','3.0.1');return;}
     foreach(sql('SELECT id FROM ca_meters ORDER BY id') as $item)transaction(function()use($item){
         $m=one('SELECT * FROM ca_meters WHERE id=? FOR UPDATE',[$item['id']]);
-        if(!latest($m)){$room=$m['roomverify'];if($room===''){$rooms=state((int)$m['id'],'rooms',[]);if(count($rooms)===1)$room=(string)$rooms[0]['roomverify'];}
+        if(!latest($m,true)){$room=$m['roomverify'];if($room===''){$rooms=state((int)$m['id'],'rooms',[]);if(count($rooms)===1)$room=(string)$rooms[0]['roomverify'];}
             if($room!==''){$series=hash('sha256',$m['school_code'].':'.unseal($m['account_secret']).':'.$room.':'.$m['business_type']);$prior=one('SELECT revision FROM ca_readings WHERE meter_id=? AND series=? ORDER BY ts DESC,id DESC LIMIT 1',[$m['id'],$series]);if($prior){$m['revision']=(int)$prior['revision'];sql('UPDATE ca_meters SET revision=? WHERE id=?',[$m['revision'],$m['id']]);set_state((int)$m['id'],'risk',['level'=>'normal']);event((int)$m['id'],microtime(true),'history_restored',['revision'=>$m['revision']]);}}
         }
         rebuild_schedule($m,microtime(true));
     });
     set_setting('model_migrated_v301',true);set_setting('app_version','3.0.1');
+}
+
+function migrate_v302(): void {
+    migrate_v301();
+    if(!setting('history_continuity_v302',false)){
+        foreach(sql('SELECT id FROM ca_meters ORDER BY id') as $item)transaction(function()use($item){
+            $m=one('SELECT * FROM ca_meters WHERE id=? FOR UPDATE',[$item['id']]);
+            if($m['roomverify']===''&&meter_series_hint($m)===null){$r=latest($m,true);if($r)set_state((int)$m['id'],'active_series',['query_hash'=>meter_query_fingerprint($m),'series'=>$r['series']]);}
+            rebuild_schedule($m,microtime(true));
+        });set_setting('history_continuity_v302',true);
+    }
+    set_setting('app_version','3.0.2');
 }
