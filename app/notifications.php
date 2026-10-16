@@ -1,11 +1,26 @@
 <?php
 declare(strict_types=1);
-function template_defaults(string $kind): array {return $kind==='daily'?['key1'=>'{label}周五电量通报','key2'=>'{time}','key3'=>'{summary}']:['key1'=>'{label}，剩余{balance}，请及时充值','key2'=>'{balance}'];}
+function template_defaults(string $kind): array {return $kind==='daily'?['key1'=>'{event}','key2'=>'{level}','key3'=>'{label}','key4'=>'{time}','key5'=>'{summary}']:['key1'=>'{label}，剩余{balance}，请及时充值','key2'=>'{balance}'];}
+function channel_templates(string $kind,?array $templates=null): array {
+    if($templates===null)return template_defaults($kind);
+    if($kind==='daily'&&!isset($templates['key4'])&&!isset($templates['key5']))return ['key1'=>($templates['key1']??'')==='{label}周五电量通报'?'{event}':($templates['key1']??'{event}'),'key2'=>'{level}','key3'=>'{label}','key4'=>$templates['key2']??'{time}','key5'=>$templates['key3']??'{summary}'];
+    return array_replace(template_defaults($kind),$templates);
+}
+function notice_vars(string $label,array $payload,float $now,string $balance): array {
+    return ['label'=>$label,'time'=>$payload['event_time']??date('Y-m-d H:i:s',(int)$now),'balance'=>$payload['balance_display']??$balance,'summary'=>$payload['summary_short']??'低电量，请及时充值','voice'=>$payload['voice_text']??'请查看电量监控','event'=>$payload['event_name']??'低电量提醒','level'=>$payload['alert_level']??(($payload['event_kind']??'')==='emergency'?'紧急':'日常'),'remaining_hours'=>isset($payload['remaining_hours'])?number_format((float)$payload['remaining_hours'],1,'.',''):'未知','empty_at'=>isset($payload['empty_at'])?date('m-d H:i',(int)$payload['empty_at']):'未知'];
+}
+/** Center forecast, matching the dashboard; unknown/learning/expired paths never trigger. */
+function forecast_notice_candidate(array $a,float $now,array $o): ?array {
+    $run=$a['forecast_run']??null;if(!$run||!empty($a['provisional'])||!empty($a['forecast_expired'])||($a['rate']??0)<=1e-6)return null;
+    $age=($now-(float)$run['origin'])/3600;if($age<0||$age>=72||($run['zero_center']??null)===null||($run['zero_center']??0)>72||($run['zero_center']??0)<0)return null;
+    $hours=max(0.,(float)$run['zero_center']-$age);return ['hours'=>$hours,'empty_at'=>(float)$run['origin']+(float)$run['zero_center']*3600,'below'=>$hours<(float)$o['forecast_notice_hours']];
+}
 function render_fields(array $templates,array $vars): array {$map=[];foreach($vars as $k=>$v)$map['{'.$k.'}']=(string)$v;$out=[];foreach($templates as $k=>$v)$out[$k]=strtr($v,$map);return $out;}
 function notification_wire(array $m,array $ch,array $payload,float $now): array {
     if($ch['mode']==='mapped')return $payload;
-    $r=latest($m);$vars=['label'=>$m['label'],'time'=>$payload['event_time']??date('Y-m-d H:i:s',(int)$now),'balance'=>$payload['balance_display']??($r?number_format((float)$r['balance'],1,'.','').'度':'暂无数据'),'summary'=>$payload['summary_short']??'低电量，请及时充值','voice'=>$payload['voice_text']??'请查看电量监控','event'=>$payload['event_name']??'低电量提醒'];
-    return render_fields(isset($ch['templates'])?json_decode($ch['templates'],true):state((int)$m['id'],'templates:'.$ch['kind'],template_defaults($ch['kind'])),$vars);
+    $r=latest($m);$vars=notice_vars($m['label'],$payload,$now,$r?number_format((float)$r['balance'],1,'.','').'度':'暂无数据');
+    $raw=isset($ch['templates'])?json_decode($ch['templates'],true):state((int)$m['id'],'templates:'.$ch['kind'],null);
+    return render_fields(channel_templates($ch['kind'],is_array($raw)?$raw:null),$vars);
 }
 function public_ip(string $host): string {
     $host=trim($host,'[]');$ips=filter_var($host,FILTER_VALIDATE_IP)?[$host]:@gethostbynamel($host);

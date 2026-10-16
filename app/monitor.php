@@ -5,7 +5,7 @@ function manual_reason(array $m,float $now): string {
     if(!(int)$m['enabled'])return '此监控项目已暂停';if(one("SELECT id FROM ca_attempts WHERE meter_id=? AND state='started' AND ts>?",[$m['id'],$now-120]))return '已有查询正在执行';return '';
 }
 function reserve_attempt(array $m,float $now,string $kind): ?int {
-    return transaction(function()use($m,$now,$kind){$fresh=one('SELECT m.id,m.enabled,m.revision,u.enabled AS owner_enabled FROM ca_meters m JOIN ca_users u ON u.id=m.user_id WHERE m.id=? FOR UPDATE',[$m['id']]);if(!$fresh||!(int)$fresh['enabled']||!(int)$fresh['owner_enabled']||(int)$fresh['revision']!==(int)$m['revision'])return null;$o=options($m);[$day,$start,$end]=bounds($now,$o);$count=quota((int)$m['id'],$day);$last=one("SELECT MAX(ts) ts FROM ca_attempts WHERE meter_id=? AND kind<>'manual'",[$m['id']])['ts'];
+    return transaction(function()use($m,$now,$kind){$fresh=one('SELECT m.*,u.enabled AS owner_enabled FROM ca_meters m JOIN ca_users u ON u.id=m.user_id WHERE m.id=? FOR UPDATE',[$m['id']]);if(!$fresh||!(int)$fresh['enabled']||!(int)$fresh['owner_enabled']||(int)$fresh['revision']!==(int)$m['revision'])return null;$m=array_replace($m,$fresh);$o=options($m);[$day,$start,$end]=bounds($now,$o);$count=quota((int)$m['id'],$day);$last=one("SELECT MAX(ts) ts FROM ca_attempts WHERE meter_id=? AND kind<>'manual'",[$m['id']])['ts'];
         if($kind!=='manual'&&($count>=$o['max_queries']||($kind!=='final'&&$count>=$o['max_queries']-1)||($last!==null&&$now-(float)$last<$o['min_gap_minutes']*60)||one("SELECT id FROM ca_attempts WHERE meter_id=? AND day=? AND kind='final'",[$m['id'],$day])))return null;
         if(manual_reason($m,$now)!=='')return null;if($kind==='final'&&($now<$end||$now>$end+900))return null;
         sql('INSERT INTO ca_attempts(meter_id,day,ts,kind) VALUES (?,?,?,?)',[$m['id'],$day,$now,$kind]);return (int)db()->lastInsertId();});
@@ -16,7 +16,34 @@ function enqueue_notice(array $m,string $key,string $channel,array $payload,floa
         sql('INSERT IGNORE INTO ca_outbox(meter_id,revision,unique_key,channel,day,created,expires,payload,incident,channel_version) VALUES (?,?,?,?,?,?,?,?,?,?)',[$m['id'],$m['revision'],$key.':'.$kind,$kind,date('Y-m-d',(int)$now),$now,$expires,json_value($payload),$incident,$ch['config_version']]);
     }
 }
+function forecast_notice(array $m,array $a,float $now): void {
+    $work=function()use($m,$a,$now){
+        $current=one('SELECT m.*,u.enabled AS owner_enabled FROM ca_meters m JOIN ca_users u ON u.id=m.user_id WHERE m.id=? FOR UPDATE',[$m['id']]);
+        if(!$current||!(int)$current['enabled']||!(int)$current['owner_enabled']||(int)$current['revision']!==(int)$m['revision'])return;
+        $o=options($current);if(!$o['forecast_notice_enabled'])return;$info=forecast_notice_candidate($a,$now,$o);if(!$info)return;
+        $key='forecast_notice:'.$current['revision'];$st=state((int)$m['id'],$key,['episode'=>1,'notified'=>false,'last_sent'=>null]);
+        if(!$info['below']){if(empty($a['local_projection'])&&$info['hours']>=$o['forecast_notice_hours']+2.&&!empty($st['notified'])){$st['episode']++;$st['notified']=false;set_state((int)$m['id'],$key,$st);}return;}
+        if(!empty($st['notified'])||($st['last_sent']!==null&&$now-$st['last_sent']<21600))return;
+        $hasChannel=false;foreach(['daily','webhook','smtp'] as $kind){$ch=channel_for_meter($current,$kind);if($ch&&(int)$ch['enabled'])$hasChannel=true;}if(!$hasChannel)return;
+        $summary='预计'.number_format($info['hours'],1,'.','').'小时内耗尽，预计归零'.date('m-d H:i',(int)$info['empty_at']).'，低于设定'.$o['forecast_notice_hours'].'小时，请安排充值；预测会随新读数更新';
+        enqueue_notice($current,'forecast_daily:'.$current['revision'].':'.$st['episode'],'daily',['notice_type'=>'forecast','forecast_episode'=>$st['episode'],'event_name'=>'预计电量耗尽提醒','alert_level'=>'预警','account_label'=>$current['label'],'summary_short'=>$summary,'remaining_hours'=>$info['hours'],'empty_at'=>$info['empty_at']],$now,$now+1800);
+        $st['notified']=true;$st['last_sent']=$now;set_state((int)$m['id'],$key,$st);event((int)$m['id'],$now,'forecast_notice',['summary'=>$summary,'hours'=>$info['hours'],'threshold'=>$o['forecast_notice_hours']]);
+    };
+    if(db()->inTransaction())$work();else transaction($work);
+}
+/** Recalculate immediately after a settings save; no campus query or notification is sent here. */
+function rebuild_schedule(array $m,float $now): void {
+    $id=(int)$m['id'];$o=options($m);[$day,$start,$end]=bounds($now,$o);$r=latest($m);
+    $a=$r?ts_project(json_decode($r['analysis'],true),$now,$o):['suspect'=>false,'accelerated'=>false];
+    $last=one("SELECT MAX(ts) ts FROM ca_attempts WHERE meter_id=? AND kind<>'manual'",[$id])['ts'];
+    $decision=ts_schedule($a,$now,$o,quota($id,$day),$last===null?null:(float)$last);
+    $finished=state($id,'daily:'.$day)||one("SELECT id FROM ca_attempts WHERE meter_id=? AND day=? AND kind='final'",[$id,$day]);
+    if($finished||$now>$end+900){$decision['next']=$start+86400;$decision['status']='day_finished';}elseif($now>=$end&&$now<=$end+900&&!$finished&&quota($id,$day)<$o['max_queries']){$decision['next']=$now;$decision['status']='final_reserved';}
+    elseif(!$r&&$now>=$start&&$now<$end&&quota($id,$day)<$o['max_queries']-1){$decision['next']=max($now,$last===null?$now:(float)$last+$o['min_gap_minutes']*60);$decision['next']=min($end,$decision['next']);}
+    set_state($id,'schedule',$decision);sql('UPDATE ca_meters SET next_query=? WHERE id=?',[$decision['next']??$start+86400,$id]);
+}
 function risk_events(array $m,array $a,float $now): void {
+    forecast_notice($m,$a,$now);
     $id=(int)$m['id'];$o=options($m);$risk=state($id,'risk',['level'=>'normal']);$desired=$a['critical']?'critical':($a['warning']?'warning':'normal');
     if($desired!=='normal'){if($risk['level']==='normal'){$risk=['level'=>$desired,'incident'=>bin2hex(random_bytes(16)),'started'=>$now,'clear_hits'=>0];event($id,$now,'risk_started',['level'=>$desired]);}elseif($desired==='critical'&&$risk['level']!=='critical'){$risk['level']='critical';event($id,$now,'risk_upgraded');}$risk['clear_hits']=0;}
     elseif($risk['level']!=='normal'&&empty($a['local_projection'])&&$a['can_clear']&&in_array($a['quality'],['usable','unchanged'],true)){if(!($risk['clear_hits']??0))$risk['clear_first']=$now;if(($risk['last_clear_observation']??null)!==$now){$risk['clear_hits']=($risk['clear_hits']??0)+1;$risk['last_clear_observation']=$now;}if($risk['clear_hits']>=2&&$now-$risk['clear_first']>=7200){event($id,$now,'risk_recovered');sql("UPDATE ca_outbox SET state='cancelled',details='预警已恢复' WHERE meter_id=? AND state='queued' AND incident=?",[$id,$risk['incident']]);$risk=['level'=>'normal'];}}
@@ -29,7 +56,7 @@ function schedule_next(array $m,array $a,float $now): void {
 function perform_query(array $m,float $now,string $kind,?callable $query=null): ?int {
     $id=(int)$m['id'];$attempt=reserve_attempt($m,$now,$kind);if(!$attempt)return null;$o=options($m);
     $r=null;try{$r=$query?$query($m):query_campus($m);
-        transaction(function()use($m,$now,$kind,$r,$id,$attempt,$o){$fresh=one('SELECT m.revision,m.enabled,u.enabled AS owner_enabled FROM ca_meters m JOIN ca_users u ON u.id=m.user_id WHERE m.id=? FOR UPDATE',[$id]);if((int)$fresh['revision']!==(int)$m['revision']||!(int)$fresh['enabled']||!(int)$fresh['owner_enabled'])throw new AppError('设置已改变或监控暂停，本次结果不再使用');set_state($id,'rooms',$r['rooms']??[]);
+        transaction(function()use($m,$now,$kind,$r,$id,$attempt,$o){$fresh=one('SELECT m.*,u.enabled AS owner_enabled FROM ca_meters m JOIN ca_users u ON u.id=m.user_id WHERE m.id=? FOR UPDATE',[$id]);if((int)$fresh['revision']!==(int)$m['revision']||!(int)$fresh['enabled']||!(int)$fresh['owner_enabled'])throw new AppError('设置已改变或监控暂停，本次结果不再使用');$m=array_replace($m,$fresh);$o=options($m);set_state($id,'rooms',$r['rooms']??[]);
             if(!empty($r['selection_required']))throw new AppError('有多个房间或项目，请在设置中选择正确的宿舍标识');
             $prev=latest($m);if($prev&&$prev['series']!==$r['series']){$prev=null;set_state($id,'risk',['level'=>'normal']);sql("UPDATE ca_outbox SET state='cancelled',details='房间改变' WHERE meter_id=? AND state='queued'",[$id]);}
             $old=$prev?json_decode($prev['analysis'],true):[];$segment=(float)($old['segment']??0);$rows=sql('SELECT * FROM ca_intervals WHERE meter_id=? AND revision=? AND series=? AND ts>=? AND ts<=? ORDER BY ts',[$id,$m['revision'],$r['series'],max($segment,$now-56*86400),$now]);$res=sql('SELECT ts,hours,residual FROM ca_residuals WHERE meter_id=? AND revision=? AND series=? AND ts>=? AND ts<=?',[$id,$m['revision'],$r['series'],max($segment,$now-56*86400),$now]);$start=$old['plateau_start']??($prev['ts']??$now);$fc=one('SELECT analysis FROM ca_readings WHERE meter_id=? AND revision=? AND series=? AND ts<=? AND ts>=? ORDER BY ts DESC LIMIT 1',[$id,$m['revision'],$r['series'],$start,$segment]);$forecast=$fc?json_decode($fc['analysis'],true):null;
@@ -43,11 +70,13 @@ function perform_query(array $m,float $now,string $kind,?callable $query=null): 
 function finish_day(array $m,float $now): void {
     $id=(int)$m['id'];$o=options($m);[$day,$start,$end]=bounds($now,$o);if(state($id,'daily:'.$day))return;
     transaction(function()use($m,$id,$o,$day,$now,$start){one('SELECT id FROM ca_meters WHERE id=? FOR UPDATE',[$id]);if(state($id,'daily:'.$day))return;$r=latest($m);$final=one("SELECT state,error FROM ca_attempts WHERE meter_id=? AND day=? AND kind='final'",[$id,$day]);$ok=$final&&$final['state']==='ok'&&$r&&date('Y-m-d',(int)$r['ts'])===$day;$summary=$r?'余'.number_format((float)$r['balance'],1,'.','').'度':'暂无有效电量';$a=$r?json_decode($r['analysis'],true):null;if(!$ok)$summary='收尾查询未成功，最近'.$summary;elseif(!in_array($r['quality'],['usable','unchanged'],true))$summary.='，读数变化待确认';elseif($a['critical'])$summary.='，请及时充值';elseif($a['provisional'])$summary.='，预测学习中';elseif($a['guard_hours']!==null&&$a['guard_hours']<=72)$summary.='，预计'.(int)floor($a['guard_hours']).'小时到预留线';else $summary.='，持续观察';
-        if((int)date('N',(int)$now)===5)enqueue_notice($m,'daily:'.$day,'daily',['event_name'=>$m['label'].'周五电量通报','event_time'=>date('Y-m-d H:i:s',(int)$now),'summary_short'=>$summary],$now,min($now+7200,strtotime($day.' 23:59:59')));set_state($id,'daily:'.$day,['created'=>$now,'summary'=>$summary]);event($id,$now,'daily_record',['summary'=>$summary]);sql('UPDATE ca_meters SET next_query=? WHERE id=?',[$start+86400,$id]);});
+        if((int)date('N',(int)$now)===5)enqueue_notice($m,'daily:'.$day,'daily',['event_name'=>'周五电量通报','alert_level'=>'日常','event_time'=>date('Y-m-d H:i:s',(int)$now),'summary_short'=>$summary],$now,min($now+7200,strtotime($day.' 23:59:59')));set_state($id,'daily:'.$day,['created'=>$now,'summary'=>$summary]);event($id,$now,'daily_record',['summary'=>$summary]);sql('UPDATE ca_meters SET next_query=? WHERE id=?',[$start+86400,$id]);});
 }
 function flush_notices(float $now,?callable $send=null,int $limit=8): void {
     $items=sql("SELECT o.* FROM ca_outbox o JOIN ca_meters m ON m.id=o.meter_id JOIN ca_users u ON u.id=m.user_id WHERE o.state='queued' ORDER BY o.created LIMIT ".max(1,$limit));
     foreach($items as $item){$m=one('SELECT * FROM ca_meters WHERE id=?',[$item['meter_id']]);$ch=channel_for_meter($m,$item['channel']);$u=one('SELECT enabled FROM ca_users WHERE id=?',[$m['user_id']]);$risk=state((int)$m['id'],'risk',['level'=>'normal']);$cancel=!(int)$m['enabled']||!(int)$u['enabled']||!$ch||!(int)$ch['enabled']||(int)$item['revision']!==(int)$m['revision']||(int)$item['channel_version']!==(int)($ch['config_version']??0)||($item['incident']!==null&&($risk['level']!=='critical'||($risk['incident']??'')!==$item['incident']));
+        $queuedPayload=json_decode($item['payload'],true);
+        if(($queuedPayload['notice_type']??'')==='forecast'){$o=options($m);$st=state((int)$m['id'],'forecast_notice:'.$m['revision'],[]);$anchor=latest($m);$info=$anchor?forecast_notice_candidate(json_decode($anchor['analysis'],true),$now,$o):null;$cancel=$cancel||!$o['forecast_notice_enabled']||empty($st['notified'])||($st['episode']??0)!==($queuedPayload['forecast_episode']??-1)||!$info||!$info['below'];}
         if($cancel||$now>$item['expires']){sql('UPDATE ca_outbox SET state=?,details=? WHERE id=?',[$cancel?'cancelled':'expired',$cancel?'通知关闭或配置已改变':'通知过期',$item['id']]);continue;}
         $payload=json_decode($item['payload'],true);$extra=in_array($item['channel'],['webhook','smtp'],true);$wire=$extra?['title'=>$payload['event_name']??($m['label'].'低电量提醒'),'type'=>$payload['event_kind']??'emergency','meter'=>$m['label'],'time'=>$payload['event_time']??date(DATE_ATOM,(int)$now),'message'=>$payload['summary_short']??$payload['voice_text']??'请及时充值','balance'=>$payload['balance_display']??null]:notification_wire($m,$ch,$payload,$now);
         $claim=db()->prepare("UPDATE ca_outbox SET state='sending',attempts=attempts+1 WHERE id=? AND state='queued'");$claim->execute([$item['id']]);if($claim->rowCount()!==1)continue;$state='unknown';$detail='发送结果未知，不自动重发';$requestId=null;

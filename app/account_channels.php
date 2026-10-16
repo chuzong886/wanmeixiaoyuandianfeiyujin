@@ -5,7 +5,7 @@ function channel_for_meter(array $m,string $kind): ?array {return account_channe
 function account_channel_public(int $uid): array {
     $out=[];
     foreach(['daily','emergency','webhook','smtp'] as $kind){
-        $ch=account_channel($uid,$kind);$v=['enabled'=>(bool)($ch['enabled']??false),'configured'=>($ch['secret']??'')!=='','mode'=>$ch['mode']??'fixed','templates'=>$ch?json_decode($ch['templates'],true):template_defaults($kind==='daily'?'daily':'emergency')];
+        $ch=account_channel($uid,$kind);$v=['enabled'=>(bool)($ch['enabled']??false),'configured'=>($ch['secret']??'')!=='','mode'=>$ch['mode']??'fixed','templates'=>channel_templates($kind,$ch?json_decode($ch['templates'],true):null)];
         if(in_array($kind,['daily','emergency'],true))$v['url']=$ch?unseal($ch['secret']):'';
         elseif($ch&&$ch['secret']!==''){$extra=json_decode(unseal($ch['secret']),true);unset($extra['password']);$v+=$extra;}
         $out[$kind]=$v;
@@ -15,11 +15,11 @@ function cancel_account_channel(int $uid,string $kind): void {sql("UPDATE ca_out
 function save_account_channel(array $body,array $u,bool $clear=false): void {
     transaction(function()use($body,$u,$clear){
         one('SELECT id FROM ca_users WHERE id=? FOR UPDATE',[$u['id']]);$kind=(string)($body['kind']??'');if(!in_array($kind,['daily','emergency','webhook','smtp'],true))throw new AppError('通道无效');
-        $old=account_channel((int)$u['id'],$kind);$i=$body['config']??[];if(!is_array($i))throw new AppError('配置无效');$secret=$old['secret']??'';$enabled=(bool)($i['enabled']??false);$mode=$old['mode']??'fixed';$tpl=$old?json_decode($old['templates'],true):template_defaults($kind);
+        $old=account_channel((int)$u['id'],$kind);$i=$body['config']??[];if(!is_array($i))throw new AppError('配置无效');$secret=$old['secret']??'';$enabled=(bool)($i['enabled']??false);$mode=$old['mode']??'fixed';$tpl=channel_templates($kind,$old?json_decode($old['templates'],true):null);
         if($clear){$secret='';$enabled=false;}
         elseif(in_array($kind,['daily','emergency'],true)){
             $url=trim((string)($i['url']??''));validate_secret_url($kind,$url);if($url!=='')$secret=seal($url);$mode=(string)($i['mode']??'fixed');if(!in_array($mode,['fixed','mapped'],true))throw new AppError('模板模式无效');
-            $input=$body['templates']??$tpl;if(!is_array($input))throw new AppError('模板字段无效');$tpl=[];foreach(template_defaults($kind) as $k=>$default){$v=(string)($input[$k]??$default);if(mb_strlen($v)>500)throw new AppError('每个字段最多500字');preg_match_all('/\{([^{}]+)\}/',$v,$matches);foreach($matches[1] as $token)if(!in_array($token,['label','time','balance','summary','voice','event'],true))throw new AppError('模板变量无效');$tpl[$k]=$v;}
+            $input=$body['templates']??$tpl;if(!is_array($input))throw new AppError('模板字段无效');$tpl=[];foreach(template_defaults($kind) as $k=>$default){$v=(string)($input[$k]??$default);if(mb_strlen($v)>500)throw new AppError('每个字段最多500字');preg_match_all('/\{([^{}]+)\}/',$v,$matches);foreach($matches[1] as $token)if(!in_array($token,['label','time','balance','summary','voice','event','level','remaining_hours','empty_at'],true))throw new AppError('模板变量无效');$tpl[$k]=$v;}
         }else{
             $v=$secret!==''?json_decode(unseal($secret),true):[];
             if($kind==='webhook'){$url=trim((string)($i['url']??''));if($url!=='')$v=['url'=>$url];if($v)webhook_url($v['url']);}
@@ -44,7 +44,7 @@ function test_account_channel(array $body,array $u,?callable $sender=null): arra
     $log=sql('INSERT INTO ca_channel_tests(user_id,kind,created,state,details) VALUES (?,?,?,?,?)',[$u['id'],$kind,$now,'sending','主动测试']);$logId=(int)db()->lastInsertId();session_write_close();
     try{
         if(in_array($kind,['webhook','smtp'],true)){$wire=['title'=>'校园电量通知测试','type'=>'test','test'=>true,'meter'=>$label,'time'=>date(DATE_ATOM),'message'=>'这是主动测试，请忽略'];if($sender)$sender($ch,$wire);else send_extra($ch,$wire);$state='accepted';$detail='接收服务器已受理，请检查接收端';}
-        else{$vars=['label'=>'【测试】'.$label,'time'=>$payload['event_time'],'balance'=>'测试电量','summary'=>$payload['summary_short'],'voice'=>$payload['voice_text'],'event'=>$payload['event_name']];$wire=$ch['mode']==='mapped'?$payload:render_fields(json_decode($ch['templates'],true),$vars);[$http,$reply]=$sender?$sender($ch,$wire):http_post(unseal($ch['secret']),$wire);[$state,$detail,$requestId]=spug_result($http,$reply);}
+        else{$vars=notice_vars('【测试】'.$label,$payload+['alert_level'=>'测试'],$now,'测试电量');$wire=$ch['mode']==='mapped'?$payload:render_fields(channel_templates($kind,json_decode($ch['templates'],true)),$vars);[$http,$reply]=$sender?$sender($ch,$wire):http_post(unseal($ch['secret']),$wire);[$state,$detail,$requestId]=spug_result($http,$reply);}
     }catch(AppError $e){$detail=$e->getMessage();}catch(Throwable $e){$detail='测试执行失败，请检查PHP扩展、网络及服务器日志';}
     sql('UPDATE ca_channel_tests SET state=?,details=?,request_id=? WHERE id=?',[$state,$detail,$requestId,$logId]);return ['ok'=>$state==='accepted','message'=>$detail,'state'=>$state,'request_id'=>$requestId];
 }
