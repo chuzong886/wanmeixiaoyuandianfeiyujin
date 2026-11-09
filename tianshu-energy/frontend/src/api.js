@@ -1,0 +1,6 @@
+import {tr,locale} from './i18n';
+export let csrf='';export function setCsrf(value){csrf=value;}
+export async function api(path,body){const ctrl=new AbortController(),timer=setTimeout(()=>ctrl.abort(),path==='ai-analyze'?150000:path==='device-query'?75000:20000);try{const r=await fetch('/api/'+path,{method:body===undefined?'GET':'POST',credentials:'same-origin',signal:ctrl.signal,headers:body===undefined?{}:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body===undefined?undefined:JSON.stringify(body)});let j;try{j=await r.json();}catch{throw Error(tr('服务返回了无法识别的数据'));}if(!r.ok){const e=Error(tr(j.error)||tr('请求失败'));e.status=r.status;throw e;}return j;}catch(e){if(e.name==='AbortError')throw Error(body?tr('操作结果尚未确认，请刷新状态后再操作'):tr('读取超时，请稍后重试'));throw e;}finally{clearTimeout(timer);}}
+export const n=(v,d=1)=>v!==null&&v!==undefined&&v!==''&&Number.isFinite(Number(v))?Number(v).toLocaleString(locale.value==='en'?'en-GB':'zh-CN',{minimumFractionDigits:d,maximumFractionDigits:d}):'—';
+export const date=t=>t?new Date(t*1000).toLocaleString(locale.value==='en'?'en-GB':'zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'—';
+export const stateLabel={queued:'已下发 · 待回执',dispatched:'网关已领取',confirmed:'执行已确认',rejected:'执行被拒绝',expired:'已超时 · 未确认',unknown:'执行结果未知',active:'待处理',acknowledged:'已确认收到',resolved:'已恢复'};

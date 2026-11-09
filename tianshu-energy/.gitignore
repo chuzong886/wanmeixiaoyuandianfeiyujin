@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+frontend/node_modules/
+data/
+build/
+dist/
+.toolchain/
+launcher/bin/
+launcher/obj/
+*.sqlite*
+*.log
+
+api-runtime/
